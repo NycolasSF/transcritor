@@ -11,9 +11,40 @@ python main.py
 # Access at http://localhost:8020
 ```
 
+**Bind é `127.0.0.1` desde 06/09/2026.** Estava em `0.0.0.0`, ou seja aberto a **qualquer rede
+em que o PC entrasse** (wifi de fora inclusive), sem autenticação, com acesso a arquivo e à
+`OPENAI_API_KEY`. Descoberto durante a auditoria da ponte do Hermes. Nada no hub perde nada:
+todo cliente chama `localhost:8020`. Se algum dia algo precisar alcançar o motor de outra
+máquina, a escotilha é `TRANSCRITOR_HOST=0.0.0.0` no ambiente — mas prefira o IP da tailnet a
+`0.0.0.0`. **Vale a partir do próximo restart do motor.**
+
 ## Flow — ditado por voz (cliente estilo Wispr)
 
-`flow/flow.py` é um tray app client-side: segure **Ctrl+Win**, fale, solte — o texto é digitado no app ativo. Grava o microfone, muta o som do sistema durante a gravação (pycaw; `FLOW_MUTE_SYSTEM=false` desliga), envia ao `POST /local/dictate` (síncrono, sem auth, só 127.0.0.1; o job passa pela fila normal — o pool segue único dono da GPU — e é apagado ao final: não entra no histórico nem na quota) e digita o resultado via `keyboard.write` (clipboard intocado). Modelo trocável na bandeja (small/medium/large-v3; default `FLOW_MODEL=medium`). Dicionário: `flow/vocab.txt` vira `initial_prompt` por job (coluna `initial_prompt` em `jobs`). Subir: `flow/start-flow.bat` (autostart: atalho em `shell:startup`). Deps próprias em `flow/requirements.txt`. Crash duro deixa traceback em `flow/flow-crash.log`.
+`flow/flow.py` é um tray app client-side: segure **Ctrl+Win**, fale, solte — o texto é digitado no app ativo. Grava o microfone, muta o som do sistema durante a gravação (pycaw; `FLOW_MUTE_SYSTEM=false` desliga), envia ao `POST /local/dictate` (síncrono, sem auth, só 127.0.0.1; o job passa pela fila normal — o pool segue único dono da GPU — e é apagado ao final: não entra no histórico nem na quota) e digita o resultado via `keyboard.write` (clipboard não é tocado automaticamente). Depois de transcrever, a pill mostra o texto por `RESULT_DISPLAY_SECONDS` (15s) com "clique pra copiar" — clique copia pra área de transferência (só aí o clipboard é tocado). Modelo trocável na bandeja (small/medium/large-v3; default `FLOW_MODEL=medium`).
+
+**Transcrição via API OpenAI (opcional, ago/2026):** se `OPENAI_API_KEY` estiver setada no `.env` do transcritor, o worker tenta a API primeiro **só pra jobs `source=flow-dictate`** (`core/services/openai_transcriber.py`, modelo em `OPENAI_TRANSCRIBE_MODEL`, default `gpt-4o-transcribe`) — sem cold start de VRAM (ver `MODEL_IDLE_TIMEOUT_SECONDS` abaixo). Qualquer falha (rede, key, rate limit) cai pro Whisper local automaticamente; ditado nunca fica dependente de internet. Gasto é estimado localmente (duração × preço/min, não é o saldo real da conta — a OpenAI não expõe saldo/gasto pra uma key de projeto comum) em `openai_usage.json` (gitignored), lido por `GET /local/openai-usage` e mostrado num item da bandeja do Flow. Dicionário: `flow/vocab.txt` vira `initial_prompt` por job (coluna `initial_prompt` em `jobs`). Como o job é apagado no motor, cada ditado é anexado a `flow/dictations.log` (gitignored, uma linha `timestamp\ttexto`, gravado ANTES do `keyboard.write`) — é a única cópia recuperável; abrir pela bandeja em "Histórico de ditados". Subir: `flow/start-flow.bat` (autostart: atalho em `shell:startup`). Deps próprias em `flow/requirements.txt`. Crash duro deixa traceback em `flow/flow-crash.log` (append — reinício não apaga o traceback anterior).
+
+### Watchdog — reinício automático (Flow + motor)
+
+`flow/watchdog.py` roda a cada 2 min pelo Agendador de Tarefas do Windows — instalar uma vez com `flow/install-watchdog.bat`, remover com `schtasks /Delete /TN Flow-Watchdog /F`, rodar na hora com `schtasks /Run /TN Flow-Watchdog`. Ele vigia duas coisas com sinais diferentes:
+
+- **Flow** — o loop do Tk toca `flow/flow.heartbeat` (mtime = vida, conteúdo = PID) a cada 5s, e só toca se a UI está viva **e** nenhum ditado está pendurado (>5 min em REC/BUSY). Heartbeat com mais de 90s = `taskkill` + subida pelo `start-flow.bat` (idempotente pela trava na porta 8021). "Sair" na bandeja deixa `flow/flow.stopped` e o watchdog não ressuscita — voltar é ação humana.
+- **Motor** — job em `processing` sem tocar `updated_at` = worker congelado: mata o PID que ouve a 8020, marca os jobs órfãos como erro (senão o ciclo seguinte os lê como travados e reinicia o motor para sempre) e sobe de novo. O limite é por tipo: **3 min** para ditado (`source='flow-dictate'`, curto por natureza e o que dói na hora) e **20 min** para o resto (diarização e áudio de horas passam minutos sem tocar o progresso). Porta aberta **não** prova saúde: o motor travado segue respondendo HTTP.
+
+Eventos vão para `flow/watchdog.log`; `python watchdog.py --check` roda o self-check da lógica de decisão.
+
+### Autocura dentro do Flow (travamentos de 2026-07-29)
+
+O watchdog é a última linha; antes dele o Flow se destrava sozinho — reiniciar o processo perde o ditado, então cada estado tem teto e saída:
+
+- **Gravação que nunca fechava.** O `on_key` acumula `_ctrl`/`_win` do hook, e key-up perdido (outro app rouba o foco, o shell consome o Win) deixava os dois `True` para sempre: gravava sem fim, `_finish` nunca disparava. O loop de captura agora confere as teclas no driver (`keys_really_held`, `GetAsyncKeyState` — o `keyboard.is_pressed` mente porque lê o mesmo hook furado) e tem teto de `MAX_SECONDS`.
+- **`break` do `stream.read` deixava o state em `REC` para sempre** (mic caindo no meio) — hotkey morta até reiniciar. Sair do loop por qualquer motivo agora fecha o ditado (`if self.state == REC: self._finish()`).
+- **`BUSY` pendurado** (motor travado, `keyboard.write` preso): `watchdog_tick`, chamado pelo loop do overlay, aborta em `BUSY_TIMEOUT` (= `REQUEST_TIMEOUT` + 30s) e avisa no pill. Como só se grava a partir de `IDLE`, sem esse teto a hotkey ficava morta indefinidamente.
+- **Áudio não se perde**: envio que falha grava o WAV em `flow/failed/` (gitignored) para retranscrever depois.
+
+`STUCK_SECONDS` (heartbeat) é deliberadamente maior que `MAX_SECONDS + BUSY_TIMEOUT`: dentro desse envelope o Flow resolve sozinho; passar disso é travamento fora do modelo e aí o watchdog reinicia. `python flow/test_selfheal.py` cobre os quatro casos.
+
+**Causa raiz do travamento de 2026-07-29 (QuickEdit do console):** com o QuickEdit ligado, um clique na janela do motor põe o console em modo de seleção (título vira "Selecionar Transcritor") e **bloqueia toda escrita no stdout**. O worker congelou dentro do `print` de "[Whisper] Carregando modelo…" — ainda segurando o `_model_lock` — e por 4h todo job dormiu em `processing` enquanto o servidor respondia HTTP normalmente. `main.py` agora desliga o QuickEdit no boot (`_disable_console_quick_edit`) e tem trava de instância única na porta 8022: a 8020 só passa a ouvir **depois** do lifespan (que espera o diarizer no WSL), então "porta fechada" não significa "motor ausente" — sem a trava, o watchdog subiria um segundo motor carregando Whisper na mesma GPU (CUDA OOM).
 
 ## First-time migration (from v1 JSON)
 
@@ -166,6 +197,28 @@ transcritor/
 
 - `recordings/` — temporary WAV/MP3 files (git-ignored)
 - `transcriptions/data.db` — SQLite database (git-ignored). Tables: `jobs`, `job_queue`, `benchmarks`, `speaker_profiles`, `speaker_embeddings`.
+
+#### Limpar/arquivar `recordings/` — auditar ANTES (05/08/2026)
+
+`recordings/` cresce sem teto: em 05/08/2026 estava com **6.713 arquivos / 25,48 GB**. É o maior consumo de disco da infra, e "temporary" no parágrafo acima engana — nem todo arquivo ali é descartável.
+
+**Nunca mover/apagar a pasta inteira.** Rodar antes `python scripts/audit_recordings.py`, que cruza os arquivos em disco com `jobs.file_path`/`jobs.text` (abre o banco read-only, pode rodar com o servidor no ar) e separa em três grupos:
+
+| Grupo | Significado | Ação |
+|---|---|---|
+| texto salvo em `jobs.text` | a transcrição está no BD; o áudio é redundante | arquivável |
+| job existe mas sem texto (`error`/`cancelled`) | nunca transcrito com sucesso | **manter** — é a única cópia |
+| sem job nenhum no BD | órfão (upload que não virou job) | **manter** — é a única cópia |
+
+Resultado da auditoria de 05/08: **6.605 arq / 24,57 GB arquiváveis** · 105 arq / 0,66 GB com job sem texto · 3 arq / 0,25 GB órfãos.
+
+⚠️ Mover os arquiváveis quebra o `file_path` no BD, então o botão **retranscrever** deixa de funcionar para eles — o texto e os segmentos permanecem, só o áudio-fonte sai do alcance. Trade-off aceitável para liberar 24 GB, mas é uma via de mão única.
+
+#### ✅ Arquivamento EXECUTADO em 05/08/2026
+
+Os **6.605 arquiváveis (24,57 GB)** foram movidos para **`E:\_BACKUP-claude-projetos\transcritor-recordings\`** (SSD interno, fora do espelho `/MIR` — ver o `_LEIA-ME.md` de lá). Os **108 sem transcrição ficaram** em `recordings/`, que hoje tem 108 arq / 0,91 GB.
+
+O servidor rodava durante a operação e continuou funcional (HTTP 200, banco intacto em 191,9 MB); o `robocopy` excluiu por nome os 108 protegidos e qualquer arquivo tocado nas 2h anteriores (nenhum, na hora). Reexecutar o mesmo processo quando `recordings/` voltar a crescer: rodar `scripts/audit_recordings.py`, gerar a lista dos não-arquiváveis e passar em `/XF`.
 
 ### Job lifecycle
 
