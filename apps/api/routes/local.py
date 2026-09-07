@@ -140,6 +140,20 @@ async def dictate(
             pass
 
 
+@router.get("/openai-usage")
+async def openai_usage(request: Request):
+    """Gasto estimado localmente com a API OpenAI (ditado do Flow).
+
+    A OpenAI não expõe saldo/gasto pra uma key de projeto comum (só via Admin
+    API key com escopo api.usage.read) — este número é calculado aqui, por
+    duração de áudio × preço do modelo, não é o saldo oficial da conta.
+    """
+    _require_localhost(request)
+    from core.services.openai_transcriber import get_usage_summary
+
+    return get_usage_summary()
+
+
 @router.get("/search")
 async def search_transcriptions(
     request: Request,

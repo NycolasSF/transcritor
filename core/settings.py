@@ -71,3 +71,9 @@ CPU_WORKERS: int = int(os.getenv("CPU_WORKERS", "1"))
 # Segundos de ociosidade do pool antes de descarregar Whisper + diarizador
 # da VRAM/memória. 0 = nunca descarrega (modelos ficam quentes — comportamento legado).
 MODEL_IDLE_TIMEOUT_SECONDS: int = int(os.getenv("MODEL_IDLE_TIMEOUT_SECONDS", "60"))
+
+# ── Transcrição via API OpenAI (ditado do Flow) ─────────────────────────────
+# Se definida, o ditado (source=flow-dictate) tenta a API primeiro — sem cold
+# start de VRAM — e cai pro Whisper local se a chamada falhar. Vazio = sempre local.
+OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+OPENAI_TRANSCRIBE_MODEL: str = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe")

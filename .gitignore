@@ -14,16 +14,28 @@ __pycache__/
 .env
 .env.local
 
+# Contador local de gasto na API OpenAI (ditado do Flow)
+openai_usage.json
+
 # Modelos baixados (ModelScope / 3D-Speaker)
 models/
 
 # Logs e artefatos de execução
 _server_*.log
 tmp-uvicorn-*.log
+_motor_restart.log
 flow/flow-crash.log
+flow/dictations.log
+flow/watchdog.log
+flow/flow.heartbeat
+flow/flow.stopped
+flow/failed/
 _transcricao_*.txt
 _retest_*.txt
 
 # OS
 .DS_Store
 Thumbs.db
+_diag_cache.py
+_diar_*.json
+_my_boot.log

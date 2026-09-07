@@ -2,10 +2,11 @@ import time
 import threading
 from typing import Callable, Dict, Optional
 
+from core import settings
 from core.interfaces.queue import JobQueue
 from core.interfaces.repo import TranscriptionRepo
 from core.services.transcriber import transcribe_with_progress, unload_models
-from infra.benchmark import BenchmarkContext
+from infra.benchmark import BenchmarkContext, record as record_benchmark
 from apps.api import state as _state
 
 
@@ -58,6 +59,25 @@ class Worker(threading.Thread):
                 print(f"[Worker] Erro inesperado no loop: {e}")
                 time.sleep(1)
 
+    def _try_openai(self, job_id: str, job: dict, duration: float, lang_arg: Optional[str]) -> Optional[dict]:
+        """Ditado do Flow: tenta a API OpenAI primeiro (sem cold start de VRAM).
+
+        None = falhou (rede, key inválida, rate limit...) e quem chama cai pro
+        Whisper local — ditado nunca fica dependente de internet.
+        """
+        from core.services.openai_transcriber import record_usage, transcribe_openai
+
+        t0 = time.monotonic()
+        try:
+            result = transcribe_openai(job["file_path"], language=lang_arg, prompt=job.get("initial_prompt"))
+        except Exception as e:
+            print(f"[Worker] API OpenAI falhou ({e}) — caindo pro Whisper local.")
+            return None
+
+        record_benchmark(job_id, settings.OPENAI_TRANSCRIBE_MODEL, "openai", duration, time.monotonic() - t0)
+        record_usage(duration)
+        return result
+
     def _process(self, job_id: str) -> None:
         self.current_job_id = job_id
         try:
@@ -86,22 +106,29 @@ class Worker(threading.Thread):
                         pass
 
             input_language = job.get("input_language") or "pt"
-            with BenchmarkContext(
-                job_id=job_id,
-                model=model,
-                device=self.device,
-                audio_duration=duration,
-            ):
-                result = transcribe_with_progress(
-                    file_path=job["file_path"],
-                    model_name=model,
+            lang_arg = None if input_language == "auto" else input_language
+
+            result = None
+            if job.get("source") == "flow-dictate" and settings.OPENAI_API_KEY:
+                result = self._try_openai(job_id, job, duration, lang_arg)
+
+            if result is None:
+                with BenchmarkContext(
+                    job_id=job_id,
+                    model=model,
                     device=self.device,
-                    progress_cb=progress_cb,
-                    language=None if input_language == "auto" else input_language,
-                    gpu_limit=self.gpu_limit,
-                    cpu_limit=self.cpu_limit,
-                    initial_prompt=job.get("initial_prompt"),
-                )
+                    audio_duration=duration,
+                ):
+                    result = transcribe_with_progress(
+                        file_path=job["file_path"],
+                        model_name=model,
+                        device=self.device,
+                        progress_cb=progress_cb,
+                        language=lang_arg,
+                        gpu_limit=self.gpu_limit,
+                        cpu_limit=self.cpu_limit,
+                        initial_prompt=job.get("initial_prompt"),
+                    )
 
             if result["success"] and job.get("diarize"):
                 try:
