@@ -25,6 +25,8 @@ progress_store: Dict[str, float] = {}
 # Job IDs flagged for cancellation. Read by Worker.progress_cb between Whisper
 # segments — when it sees its own job_id here, raises CancelledTranscriptionError.
 cancelled_ids: set = set()
+# ditados do Flow que pediram a API OpenAI (seletor da bandeja = "api")
+api_dictate_ids: set = set()
 
 pool = WorkerPool(
     queue=queue,

@@ -71,10 +71,14 @@ async def dictate(
     da GPU — e é apagado ao final: ditado não é histórico, não conta quota.
     """
     _require_localhost(request)
+    card_id = "dict" + uuid.uuid4().hex[:8]
+    if model == "api":
+        # API OpenAI primeiro; se ela falhar, o worker cai no medium local
+        state.api_dictate_ids.add(card_id)
+        model = "medium"
     if model not in settings.VALID_MODELS:
         model = "medium"
 
-    card_id = "dict" + uuid.uuid4().hex[:8]
     os.makedirs(settings.RECORDINGS_DIR, exist_ok=True)
     dest = os.path.join(settings.RECORDINGS_DIR, f"dictate_{card_id}.wav")
     with open(dest, "wb") as out:

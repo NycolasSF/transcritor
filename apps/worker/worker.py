@@ -109,7 +109,7 @@ class Worker(threading.Thread):
             lang_arg = None if input_language == "auto" else input_language
 
             result = None
-            if job.get("source") == "flow-dictate" and settings.OPENAI_API_KEY:
+            if job_id in _state.api_dictate_ids and settings.OPENAI_API_KEY:
                 result = self._try_openai(job_id, job, duration, lang_arg)
 
             if result is None:
@@ -182,3 +182,4 @@ class Worker(threading.Thread):
             self.current_job_id = None
             _state.progress_store.pop(job_id, None)
             _state.cancelled_ids.discard(job_id)
+            _state.api_dictate_ids.discard(job_id)

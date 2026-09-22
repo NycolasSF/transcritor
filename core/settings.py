@@ -76,4 +76,4 @@ MODEL_IDLE_TIMEOUT_SECONDS: int = int(os.getenv("MODEL_IDLE_TIMEOUT_SECONDS", "6
 # Se definida, o ditado (source=flow-dictate) tenta a API primeiro — sem cold
 # start de VRAM — e cai pro Whisper local se a chamada falhar. Vazio = sempre local.
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-OPENAI_TRANSCRIBE_MODEL: str = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe")
+OPENAI_TRANSCRIBE_MODEL: str = os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1")  # gpt-4o-transcribe é LLM: às vezes RESPONDE ao ditado em vez de transcrever (set/2026)

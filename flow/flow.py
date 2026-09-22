@@ -8,7 +8,7 @@ Peças:
   - hotkey global (lib keyboard): Ctrl+Win segurado = push-to-talk
   - microfone padrão do Windows via pyaudiowpatch
   - POST /local/dictate no transcritor (localhost:8020, sem auth, síncrono)
-  - o texto é DIGITADO no app ativo via keyboard.write — não toca o clipboard
+  - o texto é COLADO no app ativo (Ctrl+V) e o clipboard anterior é restaurado
   - overlay pill (Tkinter) no rodapé da tela: nível do mic + estado
   - ícone na bandeja (pystray): pausar/retomar, sair
 
@@ -19,6 +19,7 @@ Requer o motor no ar (python main.py na pasta do transcritor).
 import array
 import io
 import json
+import math
 import os
 import sys
 import threading
@@ -31,12 +32,14 @@ import wave
 import winsound
 
 import keyboard
+import pyperclip
 import pyaudiowpatch as pyaudio
 
 # ── Config ──────────────────────────────────────────────────────────────────
 API = os.getenv("TRANSCRITOR_URL", "http://localhost:8020")
-MODEL = os.getenv("FLOW_MODEL", "medium")
-MODEL_CHOICES = ("small", "medium", "large-v3")   # submenu da bandeja
+MODEL = os.getenv("FLOW_MODEL", "api")
+# submenu da bandeja; "api" = OpenAI (OPENAI_TRANSCRIBE_MODEL no motor), cai no medium local se falhar
+MODEL_CHOICES = ("api", "small", "medium", "large-v3")
 LANGUAGE = os.getenv("FLOW_LANGUAGE", "pt")
 MIN_SECONDS = 0.3          # gravação menor que isso = toque acidental, ignora
 MAX_SECONDS = 300          # teto da gravação: acima disso fecha e manda o que tem
@@ -66,11 +69,24 @@ FAILED_DIR = os.path.join(HERE, "failed")
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
 
-# Cores da marca
-NAVY = "#050d1a"
-GOLD = "#c9a84c"
-RED = "#e05252"
-GREY = "#5a5a6e"
+# Paleta NSF (marca pessoal, _identity/identidade-visual/tokens.tokens.json)
+BG = "#0A0A0A"       # void
+BORDER = "#2A2A2A"   # contorno da pill
+FG = "#E6E4E1"       # off-white quente: onda e texto
+MUTED = "#A8A6A2"    # cronômetro, onda de "transcrevendo", legendas
+ACCENT = "#FE5423"   # laranja NSF: só o ponto de gravação
+ERROR = "#F87171"
+WAVE_BARS = 30          # barras da onda na pill (história de ~2s do mic)
+
+
+def mic_level(samples) -> float:
+    """RMS do chunk em escala de dB mapeada para 0..1: -50 dBFS = 0 (silêncio vira
+    ponto), -10 dBFS = 1. Linear (pico) deixava fala baixa invisível e grito chapado."""
+    if not samples:
+        return 0.0
+    rms = math.sqrt(sum(s * s for s in samples) / len(samples)) / 32768.0
+    return min(max((20 * math.log10(rms + 1e-9) + 50) / 40, 0.0), 1.0)
+
 
 IDLE, REC, BUSY = "idle", "rec", "busy"
 
@@ -104,6 +120,37 @@ def log_dictation(text: str) -> None:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{line}\n")
     except OSError:
         pass  # ponytail: histórico é conveniência — nunca derruba o ditado
+
+
+def modifiers_held() -> bool:
+    """Algum Ctrl/Shift/Alt/Win ainda descido no driver. Colar com Ctrl preso
+    vira atalho; o keyboard.is_pressed lê o hook, que perde key-up."""
+    try:
+        import ctypes
+
+        g = ctypes.windll.user32.GetAsyncKeyState
+        return any(g(vk) & 0x8000 for vk in (0x11, 0x10, 0x12, 0x5B, 0x5C))
+    except Exception:
+        return False
+
+
+def paste_text(text: str) -> None:
+    """Entrega o texto COLANDO (Ctrl+V), não digitando letra a letra: instantâneo,
+    atômico (tecla do usuário no meio não embaralha) e sem o "m" virar Ctrl+M =
+    ENTER em terminal. O clipboard anterior (texto) volta logo depois.
+    ponytail: só restaura texto; imagem copiada antes do ditado se perde."""
+    try:
+        prev = pyperclip.paste()
+    except Exception:
+        prev = None
+    pyperclip.copy(text)
+    keyboard.send("ctrl+v")
+    time.sleep(0.4)  # o app alvo lê o clipboard de forma assíncrona
+    if prev is not None:
+        try:
+            pyperclip.copy(prev)
+        except Exception:
+            pass
 
 
 def keys_really_held() -> bool:
@@ -175,7 +222,8 @@ class Flow:
         self.error_until = 0.0
         self.last_text = ""        # último texto transcrito, pronto pra copiar da pill
         self.last_text_until = 0.0
-        self.levels = [0.0] * 16   # níveis recentes do mic (0..1) para o overlay
+        self.last_rec_s = self.last_busy_s = 0.0
+        self.levels = [0.0] * WAVE_BARS   # níveis recentes do mic (0..1) para o overlay
         self.vocab = load_vocab()
         self._prev_mute = None     # estado do mute do sistema antes da gravação
         self._lock = threading.Lock()
@@ -235,8 +283,7 @@ class Flow:
                 break
             self._frames.append(data)
             samples = array.array("h", data)
-            peak = max((abs(s) for s in samples), default=0) / 32768.0
-            self.levels.append(min(peak * 3.0, 1.0))  # ganho p/ visual responder
+            self.levels.append(mic_level(samples))
             del self.levels[0]
             # Rede de segurança do push-to-talk: o hook pode ter perdido o key-up
             # (gravação eterna) — o driver é a fonte de verdade. E teto de duração
@@ -273,6 +320,7 @@ class Flow:
         self._restore_mute()
         _beep(440)
         duration = time.time() - self._t0
+        self.last_rec_s = duration
         frames, self._frames = self._frames, []
         self._teardown_audio()
 
@@ -304,8 +352,9 @@ class Flow:
             log_dictation(text)  # grava ANTES de digitar: se o write falhar, o texto sobrevive
             self.last_text = text
             self.last_text_until = time.time() + RESULT_DISPLAY_SECONDS
+            self.last_busy_s = time.time() - self._busy_since
             self._wait_modifiers_released()
-            keyboard.write(text + " ", delay=0)
+            paste_text(" ".join(text.split()) + " ")  # sem \r/\n: quebra de linha = ENTER no terminal
         self.state = IDLE
 
     def _wait_modifiers_released(self, timeout: float = 3.0) -> None:
@@ -313,8 +362,7 @@ class Flow:
         t0 = time.time()
         while time.time() - t0 < timeout:
             try:
-                held = (keyboard.is_pressed("ctrl") or keyboard.is_pressed("left windows")
-                        or keyboard.is_pressed("right windows"))
+                held = modifiers_held()
             except Exception:
                 held = self._ctrl or self._win
             if not held:
@@ -372,6 +420,13 @@ def _beep(freq: int) -> None:
 
 
 # ── Overlay (pill no rodapé, Tkinter) ───────────────────────────────────────
+def fmt_secs(s: float) -> str:
+    """Cronômetro da pill: 0,8s · 12s · 1:05."""
+    if s < 10:
+        return f"{s:.1f}s".replace(".", ",")
+    return f"{int(s)}s" if s < 60 else f"{int(s) // 60}:{int(s) % 60:02d}"
+
+
 class Overlay:
     W, H, R = 240, 46, 22
     TRANSPARENT = "#ff00ff"
@@ -391,6 +446,7 @@ class Overlay:
         self._visible = False
         self._last_beat = 0.0
         self._show_copied = False
+        self._disp = [0.0] * WAVE_BARS   # alturas exibidas, suavizadas rumo ao nível real
         root.withdraw()
         self._tick()
 
@@ -412,9 +468,31 @@ class Overlay:
 
     def _round_pill(self):
         c, w, h, r = self.canvas, self.W, self.H, self.R
-        c.create_oval(0, 0, 2 * r, h, fill=NAVY, outline=NAVY)
-        c.create_oval(w - 2 * r, 0, w, h, fill=NAVY, outline=NAVY)
-        c.create_rectangle(r, 0, w - r, h, fill=NAVY, outline=NAVY)
+        # borda de 1px (pill na cor da borda + pill de fundo 1px menor): sem ela a
+        # pill some sobre janela escura
+        for inset, col in ((0, BORDER), (1, BG)):
+            c.create_oval(inset, inset, 2 * r - inset, h - inset, fill=col, outline=col)
+            c.create_oval(w - 2 * r + inset, inset, w - inset, h - inset, fill=col, outline=col)
+            c.create_rectangle(r, inset, w - r, h - inset, fill=col, outline=col)
+
+    def _wave(self, targets, color) -> None:
+        """Barras finas de ponta redonda; bordas afinam (janela seno) para a onda
+        nascer e morrer dentro da pill. Altura 0 = ponto, como nas referências."""
+        n, x0, x1 = len(targets), 40, self.W - 56
+        pitch, half = (x1 - x0) / (n - 1), (self.H - 18) / 2
+        for i, t in enumerate(targets):
+            d = self._disp[i]
+            d += (t - d) * (0.55 if t > d else 0.25)   # sobe rápido, desce macio
+            self._disp[i] = d
+            taper = 0.35 + 0.65 * math.sin(math.pi * (i + 0.5) / n)
+            h = d * taper * half
+            x = x0 + i * pitch
+            self.canvas.create_line(x, self.H / 2 - h, x, self.H / 2 + h,
+                                    fill=color, width=3, capstyle="round")
+
+    def _clock(self, secs: float) -> None:
+        self.canvas.create_text(self.W - 20, self.H // 2, text=fmt_secs(secs), anchor="e",
+                                fill=MUTED, font=("Segoe UI", 9))
 
     def _beat(self) -> None:
         """Heartbeat para o watchdog — só bate se o Flow está sadio de verdade:
@@ -460,34 +538,31 @@ class Overlay:
             self._round_pill()
             if show_error and f.state == IDLE:
                 self.canvas.create_text(self.W // 2, self.H // 2, text=f.error_msg[:38],
-                                        fill=RED, font=("Segoe UI", 9))
+                                        fill=ERROR, font=("Segoe UI", 9))
             elif f.state == REC:
                 self.canvas.create_oval(16, self.H // 2 - 5, 26, self.H // 2 + 5,
-                                        fill=RED, outline=RED)
-                n = len(f.levels)
-                span = self.W - 60
-                for i, lvl in enumerate(f.levels):
-                    x = 40 + i * (span // n)
-                    bar = max(3, int(lvl * (self.H - 18)))
-                    self.canvas.create_rectangle(x, self.H // 2 - bar // 2,
-                                                 x + 4, self.H // 2 + bar // 2,
-                                                 fill=GOLD, outline=GOLD)
+                                        fill=ACCENT, outline=ACCENT)
+                self._wave(list(f.levels), FG)
+                self._clock(time.time() - f._t0)
             elif f.state == BUSY:
-                dots = "." * (int(time.time() * 3) % 4)
-                self.canvas.create_text(self.W // 2, self.H // 2,
-                                        text=f"transcrevendo{dots}",
-                                        fill=GOLD, font=("Segoe UI", 10, "italic"))
+                # onda "respirando" enquanto transcreve; ponto dourado no lugar do REC
+                t = time.time()
+                self.canvas.create_oval(17, self.H // 2 - 4, 25, self.H // 2 + 4,
+                                        fill=FG, outline=FG)
+                self._wave([0.25 + 0.3 * (1 + math.sin(t * 5 - i * 0.5)) / 2
+                            for i in range(WAVE_BARS)], MUTED)
+                self._clock(time.time() - f._busy_since)
             elif show_result:
                 if self._show_copied:
                     self.canvas.create_text(self.W // 2, self.H // 2, text="Copiado!",
-                                            fill=GOLD, font=("Segoe UI", 10, "bold"))
+                                            fill=FG, font=("Segoe UI", 10, "bold"))
                 else:
                     preview = f.last_text if len(f.last_text) <= 34 else f.last_text[:31] + "..."
                     self.canvas.create_text(self.W // 2, self.H // 2 - 7, text=preview,
-                                            fill="#ffffff", font=("Segoe UI", 9))
+                                            fill=FG, font=("Segoe UI", 9))
                     self.canvas.create_text(self.W // 2, self.H // 2 + 11,
-                                            text="clique pra copiar",
-                                            fill=GOLD, font=("Segoe UI", 8))
+                                            text=f"{fmt_secs(f.last_rec_s)} · {fmt_secs(f.last_busy_s)} · clique pra copiar",
+                                            fill=MUTED, font=("Segoe UI", 8))
         self.root.after(40, self._tick)
 
 
@@ -502,9 +577,9 @@ def start_tray(flow: Flow, root: tk.Tk) -> None:
 
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.ellipse((4, 4, 60, 60), fill=NAVY)
-    d.ellipse((22, 14, 42, 40), fill=GOLD)          # cápsula do mic
-    d.rectangle((30, 40, 34, 50), fill=GOLD)         # haste
+    d.ellipse((4, 4, 60, 60), fill=BG)
+    d.ellipse((22, 14, 42, 40), fill=ACCENT)          # cápsula do mic
+    d.rectangle((30, 40, 34, 50), fill=ACCENT)         # haste
 
     def toggle(icon, item):
         flow.enabled = not flow.enabled
@@ -538,7 +613,7 @@ def start_tray(flow: Flow, root: tk.Tk) -> None:
         pystray.MenuItem(lambda item: fetch_openai_usage_text(), lambda icon, item: None),
         pystray.MenuItem("Histórico de ditados", open_history),
         pystray.MenuItem("Modelo", pystray.Menu(*[
-            pystray.MenuItem(m, pick_model(m), checked=model_checked(m), radio=True)
+            pystray.MenuItem("API OpenAI" if m == "api" else m, pick_model(m), checked=model_checked(m), radio=True)
             for m in MODEL_CHOICES
         ])),
         pystray.MenuItem("Sair", quit_app),

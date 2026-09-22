@@ -4,3 +4,4 @@ keyboard
 pystray
 Pillow
 pycaw
+pyperclip
