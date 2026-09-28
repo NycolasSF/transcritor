@@ -1,300 +1,180 @@
 # Transcritor
 
-Aplicação web para **gravação, upload e transcrição automática de áudio** com [OpenAI Whisper](https://github.com/openai/whisper), rodando 100% local — sem nenhuma API de terceiros.
+Servidor local de **transcrição de áudio e vídeo em texto**, com Whisper rodando na sua própria GPU. Grava, recebe upload, importa por URL (YouTube, Google Drive, link direto), transcreve com timestamps por palavra e separa falantes (diarização). Interface web inclusa, API REST + WebSocket para automação.
+
+Repositório: https://github.com/NycolasSF/transcritor.git
 
 ---
 
-## Funcionalidades
+## O que ele faz
 
-### Gravação
-- **Modo Microfone** — captura o microfone padrão do sistema
-- **Modo Sistema (WASAPI)** — captura o áudio do sistema (loopback), sem necessidade de Stereo Mix
-- **Modo Abas** — grava o áudio de uma ou mais abas/janelas do navegador simultaneamente, sem sobreposição de saída de som; o nome da gravação é extraído automaticamente do título da página
-
-### Upload
-- Upload de arquivos de áudio/vídeo (`.mp3`, `.mp4`, `.wav`, `.m4a`, `.ogg`, `.webm`, `.flac`)
-- Nome do arquivo usado como título padrão da transcrição
-
-### Transcrição
-- Whisper local (tiny → large), selecionável na interface
-- Aceleração por GPU (CUDA) detectada automaticamente
-- **Progresso em % em tempo real** durante toda a transcrição (gravação ou upload)
-- Re-transcrição com modelo diferente diretamente pelo painel de detalhe
-- Recuperação automática de itens travados após reinício do servidor
-
-### Histórico
-- Painel de detalhe ao clicar em qualquer linha: texto com marcações de tempo clicáveis, metadados, sidebar de exportação
-- Títulos editáveis (ícone de lápis ao hover ou campo no painel de detalhe)
-- Exportação: `.txt`, `.md`, `.vtt`, `.pdf`
-- Exclusão individual
-
-### UX
-- Checkboxes com estilo neon para seleção em massa
-- Timer preciso baseado em `Date.now()` (continua correto com aba em background)
-- WebSocket com heartbeat (ping/pong a cada 25s) para gravações longas
-- Sons de feedback (Web Audio API) e notificações nativas do OS
+| Recurso | Detalhe |
+|---|---|
+| **Transcrição** | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2), modelos `tiny` a `large-v3`, trocáveis na interface sem reiniciar. Cerca de 4 a 6x mais rápido que o `openai-whisper` na GPU (RTF ~0,11 com `medium` numa RTX 3060 Ti). |
+| **Timestamps por palavra** | Segmentos e palavras com início e fim, prontos para legenda (`.vtt`) e corte de vídeo. |
+| **Áudio longo** | Arquivos de horas são processados em blocos de 30 min, com pico de RAM de ~1 GB independente da duração. |
+| **Diarização** | Separação de falantes com 3D-Speaker (ModelScope), num microsserviço à parte (porta 9020). |
+| **Entradas** | Gravação (microfone, áudio do sistema via WASAPI, abas do navegador), upload (`mp3 mp4 wav m4a ogg webm flac`) e `POST /import-url`. |
+| **Fila** | SQLite com fila de jobs; um worker é o único dono da GPU (evita `CUDA out of memory`). Jobs travados são recuperados após reinício. |
+| **Interface web** | Histórico, busca, títulos editáveis, nomes de falantes, retranscrição com outro modelo e exportação `.txt` `.md` `.vtt` `.pdf`. |
+| **Contas** | Login com JWT (`/auth/register`, `/auth/login`) e cota de minutos por usuário. |
+| **Flow (opcional)** | Cliente de ditado por voz para Windows: segure **Ctrl+Win**, fale, solte, e o texto é colado no app ativo. Pode usar a API da OpenAI só para o ditado, com o Whisper local como fallback. |
 
 ---
 
 ## Requisitos
 
-| Item | Versão mínima |
-|------|--------------|
-| Windows | 10 / 11 |
-| macOS | 12 Monterey (Apple Silicon ou Intel) |
-| Python | 3.10+ |
-| GPU NVIDIA + CUDA | Opcional no Windows (cai para CPU) |
-| Apple Silicon MPS | Opcional no macOS (cai para CPU) |
-
-> **Notas de plataforma:**
-> - **Captura do sistema (loopback)**: nativa no Windows via WASAPI. No macOS exige driver de áudio virtual (BlackHole, Loopback ou similar).
-> - **Diarização (3D-Speaker)**: roda em WSL2 no Windows e nativa no macOS (sem WSL).
-> - **Modo Abas**: requer Chrome/Edge 109+ (funciona em ambos os sistemas).
+- **Python 3.10+** e **ffmpeg** no `PATH`.
+- **GPU NVIDIA com CUDA** recomendada (sem GPU, roda em CPU, bem mais lento).
+- **Windows 10/11** para a captura do áudio do sistema (WASAPI, `pyaudiowpatch`). No macOS/Linux, upload, URL e API funcionam; a captura do sistema precisa de driver virtual (ex.: BlackHole) ou do modo Abas.
+- **Diarização no Windows**: o 3D-Speaker não roda no Python nativo do Windows, então vai no **WSL2 (Ubuntu)**. No Linux/macOS roda nativo. Se não for usar diarização, pule essa parte.
 
 ---
 
-## Instalação (Windows)
+## Instalação
 
 ```bash
-# 1. Clone o repositório
-git clone https://github.com/NycolasSF/audio-agent.git
-cd audio-agent
+git clone https://github.com/NycolasSF/transcritor.git
+cd transcritor
 
-# 2. Instale as dependências
-#    Windows: execute install.bat   OU
-pip install -r requirements.txt
+python -m venv .venv
+# Windows: .venv\Scripts\activate    |    Linux/macOS: source .venv/bin/activate
 
-# 3. (Opcional) Copie e ajuste o arquivo de ambiente
-copy .env.example .env
+# GPU NVIDIA: instale o PyTorch com CUDA ANTES do requirements
+# https://pytorch.org/get-started/locally/
+
+pip install -r requirements.txt       # no macOS/Linux, sem o pyaudiowpatch:
+                                      # grep -v pyaudiowpatch requirements.txt | pip install -r /dev/stdin
+cp .env.example .env                  # Windows: copy .env.example .env
 ```
 
-> Se você tiver GPU NVIDIA, instale o PyTorch com suporte a CUDA em [pytorch.org](https://pytorch.org/get-started/locally/) antes de rodar `pip install`.
+No Windows existe também o `install.bat`.
+
+### Configurar o `.env`
+
+Ajuste no mínimo:
+
+```env
+WHISPER_MODEL=medium            # tiny | base | small | medium | large-v3
+JWT_SECRET_KEY=<gere um valor>  # python -c "import secrets; print(secrets.token_hex(32))"
+                                # sem ele, todo login cai a cada restart
+DIARIZER_AUTOSTART=false        # true só se o microsserviço de diarização estiver instalado
+```
+
+Se for usar diarização no WSL, troque `DIARIZER_START_SCRIPT` pelo caminho do `wsl-diarizer/start.sh` na **sua** máquina (o valor do exemplo aponta para a pasta original). Os demais parâmetros (fila, limite de GPU/CPU, descarregar modelo ocioso) estão comentados no próprio `.env.example`.
+
+Os pesos do Whisper são baixados do HuggingFace no primeiro uso (`medium` ~1,5 GB).
 
 ---
 
-## Instalação (macOS)
+## Nota para macOS
 
-No macOS não é preciso usar WSL — a diarização (3D-Speaker) roda nativa. A única peça que muda é a captura de áudio do sistema, que exige um driver virtual (BlackHole).
+O servidor, a interface, o upload, o import por URL e a API funcionam no Mac. O que muda:
 
-### 1. Pré-requisitos via Homebrew
-
-```bash
-# Instale o Homebrew se ainda não tiver: https://brew.sh
-brew install python@3.12 ffmpeg git
-
-# (Opcional) BlackHole 2ch para capturar o áudio do sistema (modo Loopback)
-brew install --cask blackhole-2ch
-```
-
-> O `pyaudiowpatch` (usado no Windows para WASAPI loopback) **não instala no macOS**. No Mac, a captura do sistema é feita roteando o áudio para o BlackHole e selecionando-o como dispositivo de entrada — ou usando o modo **Abas** do navegador, que funciona sem driver extra.
-
-### 2. Clone e venv
-
-```bash
-git clone https://github.com/NycolasSF/audio-agent.git
-cd audio-agent
-
-python3.12 -m venv .venv
-source .venv/bin/activate
-```
-
-### 3. PyTorch
-
-```bash
-# Apple Silicon (M1/M2/M3/M4) — usa MPS (GPU integrada da Apple)
-pip install torch torchaudio
-
-# Intel Mac — apenas CPU
-pip install torch torchaudio
-```
-
-### 4. Demais dependências
-
-```bash
-pip install -r requirements.txt
-```
-
-> Se algum pacote Windows-only (ex.: `pyaudiowpatch`) estiver listado em `requirements.txt` e falhar, instale o restante ignorando-o:
-> ```bash
-> grep -v pyaudiowpatch requirements.txt | pip install -r /dev/stdin
-> ```
-
-### 5. Diarização nativa (opcional)
-
-A diarização usa 3D-Speaker via ModelScope. No macOS roda nativa, sem microsserviço WSL:
-
-```bash
-pip install 'numpy<2' modelscope datasets funasr soundfile \
-  addict simplejson sortedcontainers pillow opencv-python-headless \
-  hdbscan umap-learn pyyaml kaldiio librosa scipy
-```
-
-Configure o `.env` para apontar o diarizer pra `localhost` (sem WSL):
-
-```bash
-cp .env.example .env
-# edite e ajuste:
-#   DIARIZER_AUTOSTART=false
-#   DIARIZER_URL=http://127.0.0.1:9020
-```
-
-Rode o microsserviço de diarização em outro terminal **somente quando precisar**:
-
-```bash
-cd wsl-diarizer
-uvicorn server:app --host 127.0.0.1 --port 9020
-```
-
-> Se você não vai usar diarização (`diarize=False` em todos os jobs), pode pular este passo inteiro.
-
-### 6. Capturar áudio do sistema com BlackHole (opcional)
-
-1. Abra **Configurações de MIDI/Áudio** (`Audio MIDI Setup`).
-2. Crie um **Multi-Output Device** com `BlackHole 2ch` + sua saída normal (alto-falante/fone). Isso permite ouvir e gravar ao mesmo tempo.
-3. Defina o Multi-Output Device como saída padrão do sistema.
-4. No Transcritor, escolha `BlackHole 2ch` como dispositivo de entrada.
+| Item | No Mac |
+|---|---|
+| **Instalação** | `brew install python@3.12 ffmpeg`, depois o venv com `python3.12`. Não instale o `pyaudiowpatch` (é só Windows): `grep -v pyaudiowpatch requirements.txt \| pip install -r /dev/stdin`. `pip install torch torchaudio` padrão, sem índice CUDA. |
+| **Velocidade** | O faster-whisper (CTranslate2) não usa a GPU da Apple (Metal/MPS): roda em **CPU com int8**. Num M1/M2/M3 o `small` e o `medium` são usáveis; o `large-v3` fica lento para áudio longo. Deixe `WHISPER_COMPUTE_TYPE` vazio. |
+| **Gravar áudio do sistema** | O botão de gravação do sistema responde "exige Windows". Use o **modo Abas** do navegador (Chrome/Edge), upload de arquivo ou `/import-url`. Para capturar o som do Mac, grave com um driver virtual (BlackHole) em outro app e faça upload. |
+| **Diarização** | Sem WSL: no `.env`, `DIARIZER_AUTOSTART=false`. Instale as dependências da seção de diarização no próprio venv e rode em outro terminal: `cd wsl-diarizer && DIARIZER_USE_CUDA=false uvicorn server:app --host 127.0.0.1 --port 9020`. Em CPU é lenta; se não precisar separar falantes, ignore. |
+| **Scripts `.bat`** | `install.bat`, `start.bat` e tudo em `flow/` são Windows. No Mac, suba com `python main.py`. |
+| **Flow (ditado)** | Não roda no Mac (usa hook de teclado e áudio do Windows). |
 
 ---
 
-## Como usar
+## Uso
 
 ```bash
-# Windows: execute start.bat   OU
-python main.py
-
-# macOS (com venv ativo):
-source .venv/bin/activate
-python main.py
+python main.py        # ou start.bat no Windows
 ```
 
-Acesse **http://localhost:8020** no navegador.
+Abra **http://localhost:8020**, crie uma conta na tela de login e use a interface.
 
-| Ação | Como fazer |
-|------|-----------|
-| Gravar (microfone/sistema) | Selecione o modo e clique no botão central |
-| Gravar abas | Pill **Abas** → adicione fontes → **Gravar** |
-| Transcrever arquivo | Pill **Arquivo** → selecione arquivo e modelo |
-| Ver transcrição completa | Clique em qualquer linha da tabela |
-| Re-transcrever | Painel de detalhe → escolha modelo → **↻ Re-transcrever** |
-| Renomear | Ícone de lápis ao passar o mouse no título |
-| Exportar | Sidebar do painel de detalhe ou menu `···` |
+> O servidor escuta só em `127.0.0.1` (não fica exposto na rede). Para acessar de outra máquina, defina `TRANSCRITOR_HOST` no ambiente, de preferência com o IP de uma VPN/tailnet, nunca `0.0.0.0` numa rede aberta.
+
+### Por script (API)
+
+`clients/transcritor_client.py` é um cliente em Python puro (só stdlib). Ele espera o servidor subir, faz login com `TRANSCRITOR_EMAIL` / `TRANSCRITOR_PASSWORD` do `.env` (crie antes essa conta na interface), envia o arquivo e devolve texto + segmentos + palavras:
+
+```python
+import sys
+sys.path.insert(0, "caminho/para/transcritor/clients")
+from transcritor_client import transcribe_media   # vídeo ou áudio (extrai o áudio com ffmpeg)
+
+resultado = transcribe_media("aula.mp4", model="medium", language="pt")
+print(resultado["text"])
+```
+
+O guia completo do cliente (lote, word-level, retranscrever um trecho com modelo maior) está em `tool_transcritor.md`.
+
+Principais endpoints:
+
+| Método | Rota | Uso |
+|---|---|---|
+| `POST` | `/auth/register`, `/auth/login` | conta e token JWT |
+| `POST` | `/upload` | envia arquivo e cria o job |
+| `POST` | `/import-url` | YouTube, Google Drive ou link direto |
+| `GET` | `/transcriptions/{id}/status` | acompanha o job |
+| `GET` | `/transcriptions` | histórico |
+| `POST` | `/transcriptions/{id}/retranscribe` | refaz com outro modelo |
+| `WS` | `/ws` | gravação e progresso em tempo real |
+
+### Regra de ouro
+
+Não carregue um Whisper próprio em outro script enquanto o servidor estiver no ar. Com uma GPU só, dois modelos carregados estouram a VRAM. Todo script deve chamar este servidor, que serializa os jobs.
 
 ---
 
-## Arquitetura do fluxo de transcrição
+## Diarização (WSL2, só Windows)
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                         FRONTEND                            │
-│                                                             │
-│  [Gravação / Upload / Re-transcrever]                       │
-│         │                        │                          │
-│    WebSocket               POST /upload                     │
-│   "stop_record"         POST /retranscribe                  │
-│         │                        │                          │
-└─────────┼────────────────────────┼──────────────────────────┘
-          │                        │
-┌─────────▼────────────────────────▼──────────────────────────┐
-│                          BACKEND (main.py)                  │
-│                                                             │
-│  ┌─── JOB CRIADO ────────────────────────────────────────┐  │
-│  │                                                       │  │
-│  │  WebSocket handler         REST endpoint              │  │
-│  │  ─────────────────         ─────────────────          │  │
-│  │  _transcribe_background()  _transcribe_background_    │  │
-│  │  (envia progresso via WS)  rest()  (via polling)      │  │
-│  │                                                       │  │
-│  │  loop.run_in_executor(executor, lambda: ...)          │  │
-│  │           │                      │                    │  │
-│  └───────────┼──────────────────────┼────────────────────┘  │
-│              │                      │                        │
-│  ┌─── WORKER (ThreadPoolExecutor, max_workers=2) ────────┐  │
-│  │           ▼                      ▼                    │  │
-│  │   transcribe_with_progress(file, model, device,       │  │
-│  │                            progress_cb)               │  │
-│  │              │                                        │  │
-│  │     [Whisper tqdm hook]                               │  │
-│  │     progress_cb(pct) a cada chunk de áudio            │  │
-│  │              │                                        │  │
-│  │    Via WS: ws.send_json({percent})   ─── ao frontend  │  │
-│  │    Via REST: _active_progress[id]=pct ── polling 1.5s │  │
-│  │                                                       │  │
-│  └─── RESULTADO PERSISTIDO ─────────────────────────────┘  │
-│              │                                              │
-│    persist_transcription()  →  transcriptions/data.json     │
-│    _active_progress.pop(id)  (cleanup)                      │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-          │                        │
-┌─────────▼────────────────────────▼──────────────────────────┐
-│                         FRONTEND                            │
-│                                                             │
-│  WS "transcription_complete"   GET /transcriptions/{id}/    │
-│  → completeRow()               status → {status:"done"}     │
-│  → store atualizado            → completeRow()              │
-│  → painel de detalhe pronto    → store atualizado           │
-└─────────────────────────────────────────────────────────────┘
+Instalação única, no PowerShell:
+
+```powershell
+wsl --install -d Ubuntu --no-launch
+wsl -d Ubuntu -u root -- bash -c "
+  curl -LsSf https://astral.sh/uv/install.sh | sh &&
+  apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y ffmpeg libsndfile1 &&
+  /root/.local/bin/uv python install 3.12 &&
+  /root/.local/bin/uv venv --python 3.12 /opt/audio-diarizer/venv &&
+  export VIRTUAL_ENV=/opt/audio-diarizer/venv &&
+  /root/.local/bin/uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124 &&
+  /root/.local/bin/uv pip install 'numpy<2' modelscope datasets funasr fastapi uvicorn soundfile \
+    addict simplejson sortedcontainers pillow opencv-python-headless hdbscan umap-learn pyyaml kaldiio librosa scipy
+"
 ```
 
-### Resumo: onde o job é criado e onde o worker persiste
-
-| Etapa | Gravação (WebSocket) | Upload / Re-transcrever (REST) |
-|-------|---------------------|-------------------------------|
-| **Job criado** | `websocket_endpoint` ao receber `action: stop` | `POST /upload` ou `POST /transcriptions/{id}/retranscribe` |
-| **Worker lançado** | `loop.run_in_executor(executor, _transcribe_background)` | `loop.run_in_executor(executor, _transcribe_background_rest)` |
-| **Progresso reportado** | `ws.send_json({type:"transcription_progress", percent})` via `run_coroutine_threadsafe` | `_active_progress[id] = pct` → lido pelo `GET /status` |
-| **Resultado persistido** | `persist_transcription()` → `data.json` | `persist_transcription()` → `data.json` |
-| **Cleanup** | — | `_active_progress.pop(id)` no `finally` |
+Depois, com `DIARIZER_AUTOSTART=true`, o `main.py` sobe e derruba o microsserviço sozinho. No Linux/macOS, instale as mesmas dependências no seu ambiente e rode `uvicorn server:app --host 127.0.0.1 --port 9020` dentro de `wsl-diarizer/`.
 
 ---
 
-## Estrutura do projeto
+## Flow: ditado por voz (opcional, Windows)
+
+```bash
+pip install -r flow/requirements.txt
+flow\start-flow.bat
+```
+
+Segure **Ctrl+Win**, fale e solte. O ícone na bandeja troca o modelo (API OpenAI, `small`, `medium`, `large-v3`). A opção API exige `OPENAI_API_KEY` no `.env`; qualquer falha cai no Whisper local. `flow/vocab.txt` é o dicionário de termos do seu domínio (um por linha), usado como dica para o Whisper. `flow/install-watchdog.bat` agenda um vigia que reinicia o Flow e o servidor se travarem.
+
+---
+
+## Estrutura
 
 ```
 transcritor/
-├── main.py           # Servidor FastAPI (WebSocket + endpoints REST)
-├── recorder.py       # Captura de áudio via WASAPI loopback
-├── transcriber.py    # Transcrição com Whisper + hook de progresso via tqdm
-├── static/
-│   └── index.html    # Interface web (sem dependências externas)
-├── requirements.txt
-├── install.bat
-├── start.bat
-└── .env.example
+├── main.py                  # sobe o servidor (FastAPI + uvicorn, porta 8020)
+├── apps/api/                # rotas REST, auth JWT, WebSocket, microsserviço de diarização
+├── apps/worker/             # worker da fila (único dono da GPU)
+├── core/services/           # transcriber (faster-whisper), recorder, diarizer, downloader
+├── core/settings.py         # configuração lida do .env
+├── infra/                   # SQLite: banco, fila, repositórios, benchmark
+├── clients/                 # transcritor_client.py (cliente Python para scripts)
+├── wsl-diarizer/            # microsserviço 3D-Speaker (porta 9020)
+├── flow/                    # cliente de ditado por voz + watchdog
+├── scripts/                 # migração, auditoria de gravações, visualização do banco
+└── static/index.html        # interface web (arquivo único, sem framework)
 ```
 
-### Dados gerados (ignorados pelo git)
+Dados locais (fora do git): `recordings/` (áudios), `transcriptions/data.db` (banco), `models/` (pesos da diarização).
 
-| Caminho | Conteúdo |
-|---------|---------|
-| `recordings/` | Arquivos de áudio das gravações e uploads |
-| `transcriptions/data.json` | Histórico de transcrições salvo localmente |
-
----
-
-## Modelos Whisper
-
-| Modelo | VRAM aprox. | Qualidade |
-|--------|-------------|-----------|
-| tiny   | ~1 GB | Básica |
-| base   | ~1 GB | Boa (padrão) |
-| small  | ~2 GB | Melhor |
-| medium | ~5 GB | Ótima |
-| large  | ~10 GB | Máxima |
-
-O modelo é baixado automaticamente na primeira utilização e cacheado localmente.
-
----
-
-## Variáveis de ambiente
-
-```env
-# Modelo padrão ao iniciar (alterável na interface sem reiniciar)
-WHISPER_MODEL=base
-```
-
----
-
-## Licença
-
-MIT
+Detalhes de arquitetura, protocolo do WebSocket, ciclo de vida do job e troubleshooting: `CLAUDE.md`. Histórico de bugs: `bugsfix.md` e `nemo-windows-issues.md`.

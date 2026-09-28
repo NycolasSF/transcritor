@@ -4,7 +4,10 @@ import wave
 from datetime import datetime
 from pathlib import Path
 
-import pyaudiowpatch as pyaudio
+try:
+    import pyaudiowpatch as pyaudio
+except ImportError:
+    pyaudio = None  # ponytail: macOS/Linux sem WASAPI; o servidor sobe, só a gravação do sistema fica indisponível
 
 from core import settings
 
@@ -12,7 +15,7 @@ RECORDINGS_DIR = Path(settings.RECORDINGS_DIR)
 RECORDINGS_DIR.mkdir(exist_ok=True)
 
 CHUNK = 1024
-FORMAT = pyaudio.paInt16
+FORMAT = 8  # pyaudio.paInt16
 
 
 class AudioRecorder:
@@ -27,6 +30,11 @@ class AudioRecorder:
         self._rate = 44100
 
     def _find_loopback_device(self):
+        if pyaudio is None:
+            raise RuntimeError(
+                "Gravação do áudio do sistema exige Windows (pyaudiowpatch/WASAPI). "
+                "Use upload, import por URL ou o modo Abas."
+            )
         pa = pyaudio.PyAudio()
         try:
             wasapi_info = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
